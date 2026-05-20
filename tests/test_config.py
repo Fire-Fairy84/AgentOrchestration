@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -31,6 +30,35 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_load_dict_copies_nested_values(self):
+        source = {"app": {"features": ["alpha"]}}
+        config = Config()
+        config.load_dict(source)
+
+        source["app"]["features"].append("beta")
+
+        assert config.get("app.features") == ["alpha"]
+
+    def test_set_copies_nested_values(self):
+        source = {"features": ["alpha"]}
+        config = Config()
+        config.set("app", source)
+
+        source["features"].append("beta")
+
+        assert config.get("app.features") == ["alpha"]
+
+    def test_get_and_to_dict_do_not_expose_internal_state(self):
+        config = Config()
+        config.set("app.features", ["alpha"])
+
+        returned = config.get("app")
+        returned["features"].append("beta")
+        snapshot = config.to_dict()
+        snapshot["app"]["features"].append("gamma")
+
+        assert config.get("app.features") == ["alpha"]
 
 # 2019-02-01T18:58:35 update
 
