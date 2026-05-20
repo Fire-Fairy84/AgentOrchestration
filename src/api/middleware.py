@@ -1,22 +1,133 @@
 """API middleware components."""
 
-import time
+from contextvars import ContextVar
 import logging
-from typing import Callable
+import time
+from typing import Callable, Optional
+
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
 logger = logging.getLogger(__name__)
 
+_current_audit_actor: ContextVar[Optional[str]] = ContextVar(
+    "audit_actor",
+    default=None,
+)
+_current_auth_actor: ContextVar[Optional[str]] = ContextVar(
+    "auth_actor",
+    default=None,
+)
+
+
+def get_audit_actor() -> Optional[str]:
+    return _current_audit_actor.get()
+
+
+def get_authenticated_actor() -> Optional[str]:
+    return _current_auth_actor.get()
+
+
+def _protected_api_path(request: Request) -> bool:
+    path = request.url.path
+    return path.startswith("/api/v2") and path != "/api/v2/auth/token"
+
+
+def _bearer_token(request: Request) -> Optional[str]:
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header.removeprefix("Bearer ").strip()
+    return token or None
+
+
+def _audit_actor(request: Request) -> str:
+    actor = request.headers.get("X-Actor-ID", "").strip()
+    safe_chars = set("-_.:@")
+    if actor and all(char.isalnum() or char in safe_chars for char in actor):
+        return actor[:128]
+    return "authenticated"
+
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
-                return Response(status_code=401, content="Unauthorized")
-        return await call_next(request)
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        auth_token = _current_auth_actor.set(None)
+        request.state.authenticated_actor = None
+
+        try:
+            if _protected_api_path(request):
+                if not _bearer_token(request):
+                    logger.warning(
+                        "auth middleware rejected unauthenticated "
+                        "request %s %s",
+                        request.method,
+                        request.url.path,
+                    )
+                    return Response(
+                        status_code=401,
+                        content="Unauthorized",
+                        headers={"X-Audit-Decision": "rejected"},
+                    )
+
+                actor = _audit_actor(request)
+                request.state.authenticated_actor = actor
+                _current_auth_actor.set(actor)
+
+            return await call_next(request)
+        finally:
+            request.state.authenticated_actor = None
+            _current_auth_actor.reset(auth_token)
+
+
+class AuditMiddleware(BaseHTTPMiddleware):
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        audit_token = _current_audit_actor.set(None)
+        request.state.audit_actor = None
+
+        try:
+            if _protected_api_path(request):
+                actor = getattr(request.state, "authenticated_actor", None)
+                actor = actor or get_authenticated_actor()
+                if not actor:
+                    logger.warning(
+                        "audit middleware blocked request without "
+                        "auth state %s %s",
+                        request.method,
+                        request.url.path,
+                    )
+                    return Response(
+                        status_code=401,
+                        content="Unauthorized",
+                        headers={"X-Audit-Decision": "rejected"},
+                    )
+
+                request.state.audit_actor = actor
+                _current_audit_actor.set(actor)
+                response = await call_next(request)
+                response.headers["X-Audit-Decision"] = "accepted"
+                response.headers["X-Audit-Actor"] = "attached"
+                return response
+
+            return await call_next(request)
+        except Exception:
+            logger.exception(
+                "audit middleware failed for %s %s",
+                request.method,
+                request.url.path,
+            )
+            raise
+        finally:
+            request.state.audit_actor = None
+            _current_audit_actor.reset(audit_token)
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -26,14 +137,22 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            timestamp
+            for timestamp in self._requests[client_ip]
+            if now - timestamp < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +162,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
